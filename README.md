@@ -4,17 +4,27 @@ A lightweight CPU inference engine for Qwen3-4B models written in pure C.
 
 ## Features
 
+### Implemented
 - **Pure C Implementation** - No external dependencies beyond standard C library
-- **Multiple Quantization Support** - Supports FP16, AWQ, and FP8 quantized models
+- **AWQ Quantization** - 4-bit quantization support with on-the-fly dequantization
 - **Memory Efficient** - Uses mmap for weight loading with minimal memory footprint
-- **Cross-Platform** - Works on macOS (Apple Silicon) and Linux with architecture-specific optimizations
+- **Cross-Platform** - Works on macOS (Apple Silicon) and Linux
 - **OpenMP Support** - Multi-threaded inference for better performance
+- **Safetensors Format** - Direct loading of HuggingFace safetensors weights
+
+### Planned / Roadmap
+- [ ] Prefix Caching - Cache common prompt prefixes
+- [ ] Radix Attention - Efficient attention for repeated prefixes
+- [ ] Page Attention - Paged KV cache management
+- [ ] KV Cache Optimization - Full KV cache implementation with eviction
+- [ ] CPU Offloading - Layer-wise offloading configuration
+- [ ] SIMD Support - AVX/AVX2/AVX512 optimizations for x86
+- [ ] FP8 Support - 8-bit floating point quantization
 
 ## Supported Models
 
-- Qwen3-4B (FP16/BF16)
+- Qwen3-4B (BF16/FP16)
 - Qwen3-4B-AWQ (4-bit quantized)
-- Qwen3-4B-Instruct-FP8
 
 ## Build
 
@@ -103,23 +113,25 @@ nano-infer/
 
 ### Weight Loading
 - Uses memory-mapped files (mmap) for efficient weight loading
-- Supports safetensors format
-- Lazy loading of model layers
+- Supports safetensors format (single file and sharded)
+- Zero-copy tensor access via mmap pointers
 
 ### Quantization
 - **AWQ**: 4-bit quantization with group-wise scales and zeros
-- **FP8**: 8-bit floating point support
 - Dequantization performed on-the-fly during inference
+- Supports BF16/FP16 to FP32 conversion
 
-### KV Cache
-- Per-layer KV cache management
-- Supports variable sequence lengths
+### Attention
+- Grouped Query Attention (GQA) support
+- RoPE positional embeddings
+- Q/K normalization for AWQ models
 
 ## Performance
 
-Optimized for Apple Silicon (M1/M2/M3) with ARM NEON support:
-- Architecture-specific compiler flags
+Optimized for Apple Silicon (M1/M2/M3):
+- Architecture-specific compiler flags (`-march=armv8.5-a -mtune=apple-m1`)
 - OpenMP parallelization for matrix operations
+- Linux support with `-march=native`
 
 ## License
 
