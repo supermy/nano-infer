@@ -203,6 +203,9 @@ int main(int argc, char** argv) {
     }
     printf("Tokenizer loaded successfully\n");
     
+    config.vocab_size = tokenizer->vocab_size;
+    printf("Updated vocab_size from tokenizer: %d\n", config.vocab_size);
+    
     Qwen3Model* model = model_load(opts.model_path, &config);
     if (!model) {
         fprintf(stderr, "Failed to load model\n");

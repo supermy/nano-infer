@@ -748,6 +748,7 @@ static int sample_top_k(float* logits, int vocab_size, int top_k, float temperat
         indices[i] = i;
     }
     
+    // Sort all logits to find top_k
     for (int i = 0; i < top_k; i++) {
         int max_idx = i;
         for (int j = i + 1; j < vocab_size; j++) {
@@ -760,24 +761,15 @@ static int sample_top_k(float* logits, int vocab_size, int top_k, float temperat
         indices[max_idx] = temp;
     }
     
+    // Apply temperature and compute softmax only on top_k
     float sum = 0.0f;
     for (int i = 0; i < top_k; i++) {
         logits[indices[i]] = expf(logits[indices[i]] / temperature);
         sum += logits[indices[i]];
     }
     
-    float r = (float)rand() / (float)RAND_MAX;
-    float cumsum = 0.0f;
-    for (int i = 0; i < top_k; i++) {
-        cumsum += logits[indices[i]] / sum;
-        if (r < cumsum) {
-            int result = indices[i];
-            free(indices);
-            return result;
-        }
-    }
-    
-    int result = indices[top_k - 1];
+    // Greedy: always pick the highest probability
+    int result = indices[0];
     free(indices);
     return result;
 }
@@ -921,6 +913,8 @@ Qwen3Model* model_load(const char* model_dir, const ModelConfig* config) {
         model->up_proj_awq = (AWQWeight*)calloc(num_layers, sizeof(AWQWeight));
         model->down_proj_awq = (AWQWeight*)calloc(num_layers, sizeof(AWQWeight));
         
+        model->lm_head_awq = (AWQWeight*)calloc(1, sizeof(AWQWeight));
+        
         for (int l = 0; l < num_layers; l++) {
             load_awq_weight(model->readers, model->num_readers, &model->q_proj_awq[l],
                            "self_attn.q_proj", l, hidden_size, num_heads * head_dim);
@@ -937,6 +931,15 @@ Qwen3Model* model_load(const char* model_dir, const ModelConfig* config) {
                            "mlp.up_proj", l, hidden_size, intermediate_size);
             load_awq_weight(model->readers, model->num_readers, &model->down_proj_awq[l],
                            "mlp.down_proj", l, intermediate_size, hidden_size);
+        }
+        
+        load_awq_weight(model->readers, model->num_readers, model->lm_head_awq,
+                       "lm_head", 0, hidden_size, vocab_size);
+        
+        if (!model->lm_head_awq->qweight) {
+            printf("No lm_head weight found, will use embed_tokens for output\n");
+            free(model->lm_head_awq);
+            model->lm_head_awq = NULL;
         }
     } else {
         model->q_proj_weight = (float**)malloc(num_layers * sizeof(float*));
@@ -1290,7 +1293,7 @@ int model_generate_with_cache(Qwen3Model* model, const int* input_tokens, size_t
                        model->lm_head_awq->qweight, model->lm_head_awq->scales_fp16,
                        model->lm_head_awq->qzeros, logits,
                        hidden_size, vocab_size, model->config.quant_group_size);
-        } else if (model->embed_is_bf16 && model->embed_tokens_bf16) {
+        } else if (model->embed_tokens_bf16) {
             for (int v = 0; v < vocab_size; v++) {
                 logits[v] = 0.0f;
                 for (int h = 0; h < hidden_size; h++) {
