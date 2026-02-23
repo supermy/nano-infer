@@ -1,0 +1,66 @@
+# Build artifacts
+*.o
+*.a
+*.so
+*.dylib
+qwen3-infer
+qwen3-cli
+
+# Build directories
+build/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile.bak
+
+# IDE and editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Test binaries
+check_awq_format
+check_dtypes
+check_embed
+check_json
+check_names
+check_shapes
+check_vocab
+test_awq_dequant
+test_decode
+verify_awq
+verify_dequant
+parse_vocab_new
+
+# Output files
+output.txt
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+*.egg-info/
+.eggs/
+
+# Model files (usually large)
+models/
+*.safetensors
+*.bin
+*.gguf
+
+# Environment
+.env
+.venv/
+venv/
+ENV/
+
+# Temporary files
+*.tmp
+*.temp
+1~
