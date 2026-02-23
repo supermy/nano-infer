@@ -3,6 +3,7 @@
 #include "tokenizer.h"
 #include "model.h"
 #include "safetensors.h"
+#include "simd.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -132,7 +133,7 @@ static int generate(Qwen3Model* model, Tokenizer* tokenizer, const char* prompt,
     int* output_tokens = NULL;
     size_t output_len = 0;
     
-    int result = model_generate(model, tokens, token_len, temperature, top_k, top_p, max_length, &output_tokens, &output_len);
+    int result = model_generate_with_cache(model, tokens, token_len, temperature, top_k, top_p, max_length, &output_tokens, &output_len);
     
     if (result != 0) {
         fprintf(stderr, "Generation failed\n");
@@ -167,6 +168,10 @@ int main(int argc, char** argv) {
     
     printf("=== Qwen3-4B Inference Engine ===\n");
     printf("Version: %s\n", QWEN3_VERSION);
+    
+    SIMDLevel simd_level = simd_detect_level();
+    printf("SIMD: %s\n", simd_level_name(simd_level));
+    
     printf("Model: %s\n", opts.model_path);
     
     if (opts.verbose) {

@@ -2,48 +2,31 @@
 #include "config.h"
 #include "safetensors.h"
 #include "awq.h"
+#include "kv_cache.h"
+#include "simd.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
 #include <stdint.h>
 
+static SIMDLevel g_simd_level = SIMD_NONE;
+
+void model_init_simd(void) {
+    g_simd_level = simd_detect_level();
+    printf("SIMD Level: %s\n", simd_level_name(g_simd_level));
+}
+
 static void rms_norm(float* output, const float* input, const float* weight, int hidden_size, float eps) {
-    float variance = 0.0f;
-    for (int i = 0; i < hidden_size; i++) {
-        variance += input[i] * input[i];
-    }
-    variance /= hidden_size;
-    variance += eps;
-    
-    float inv_std = 1.0f / sqrtf(variance);
-    
-    for (int i = 0; i < hidden_size; i++) {
-        output[i] = weight[i] * input[i] * inv_std;
-    }
+    simd_rms_norm_f32(output, input, weight, hidden_size, eps, g_simd_level);
 }
 
 static void silu(float* x, int n) {
-    for (int i = 0; i < n; i++) {
-        x[i] = x[i] / (1.0f + expf(-x[i]));
-    }
+    simd_silu_f32(x, n, g_simd_level);
 }
 
 static void softmax(float* x, int n) {
-    float max_val = -1e9f;
-    for (int i = 0; i < n; i++) {
-        if (x[i] > max_val) max_val = x[i];
-    }
-    
-    float sum = 0.0f;
-    for (int i = 0; i < n; i++) {
-        x[i] = expf(x[i] - max_val);
-        sum += x[i];
-    }
-    
-    for (int i = 0; i < n; i++) {
-        x[i] /= sum;
-    }
+    simd_softmax_f32(x, n, g_simd_level);
 }
 
 static inline float bf16_to_f32(uint16_t bf16) {
@@ -134,6 +117,20 @@ static void matmul(
             sum += input[i] * weight[j * in_features + i];
         }
         output[j] = sum;
+    }
+}
+
+static void apply_rope_single(float* vec, int pos, int head_dim, float rope_theta) {
+    for (int d = 0; d < head_dim; d += 2) {
+        float freq = 1.0f / powf(rope_theta, (float)d / head_dim);
+        float angle = (float)pos * freq;
+        float cos_val = cosf(angle);
+        float sin_val = sinf(angle);
+        
+        float v0 = vec[d];
+        float v1 = vec[d + 1];
+        vec[d] = v0 * cos_val - v1 * sin_val;
+        vec[d + 1] = v0 * sin_val + v1 * cos_val;
     }
 }
 
@@ -384,6 +381,239 @@ static void awq_mlp(
     free(up);
 }
 
+static void mlp_single(Qwen3Model* model, const float* hidden_states, float* output, int layer_idx) {
+    int hidden_size = model->config.hidden_size;
+    int intermediate_size = model->config.intermediate_size;
+    
+    float* gate_proj = model->gate_proj_weight[layer_idx];
+    float* up_proj = model->up_proj_weight[layer_idx];
+    float* down_proj = model->down_proj_weight[layer_idx];
+    
+    float* gate = (float*)malloc(intermediate_size * sizeof(float));
+    float* up = (float*)malloc(intermediate_size * sizeof(float));
+    
+    matmul(hidden_states, gate_proj, gate, hidden_size, intermediate_size);
+    matmul(hidden_states, up_proj, up, hidden_size, intermediate_size);
+    
+    silu(gate, intermediate_size);
+    
+    for (int i = 0; i < intermediate_size; i++) {
+        gate[i] *= up[i];
+    }
+    
+    matmul(gate, down_proj, output, intermediate_size, hidden_size);
+    
+    free(gate);
+    free(up);
+}
+
+static void attention_single(Qwen3Model* model, const float* hidden_states, float* output, int pos, int layer_idx) {
+    int hidden_size = model->config.hidden_size;
+    int num_heads = model->config.num_attention_heads;
+    int num_kv_heads = model->config.num_key_value_heads;
+    int head_dim = model->config.head_dim;
+    float rope_theta = model->config.rope_theta;
+    
+    float* q_proj = model->q_proj_weight[layer_idx];
+    float* k_proj = model->k_proj_weight[layer_idx];
+    float* v_proj = model->v_proj_weight[layer_idx];
+    float* o_proj = model->o_proj_weight[layer_idx];
+    
+    float* q = (float*)malloc(num_heads * head_dim * sizeof(float));
+    float* k = (float*)malloc(num_kv_heads * head_dim * sizeof(float));
+    float* v = (float*)malloc(num_kv_heads * head_dim * sizeof(float));
+    
+    matmul(hidden_states, q_proj, q, hidden_size, num_heads * head_dim);
+    matmul(hidden_states, k_proj, k, hidden_size, num_kv_heads * head_dim);
+    matmul(hidden_states, v_proj, v, hidden_size, num_kv_heads * head_dim);
+    
+    for (int h = 0; h < num_heads; h++) {
+        apply_rope_single(q + h * head_dim, pos, head_dim, rope_theta);
+    }
+    for (int h = 0; h < num_kv_heads; h++) {
+        apply_rope_single(k + h * head_dim, pos, head_dim, rope_theta);
+    }
+    
+    if (model->kv_cache) {
+        kv_cache_append(model->kv_cache, layer_idx, pos, k, v);
+    }
+    
+    int kv_len = pos + 1;
+    float* k_cached = (float*)malloc(kv_len * num_kv_heads * head_dim * sizeof(float));
+    float* v_cached = (float*)malloc(kv_len * num_kv_heads * head_dim * sizeof(float));
+    
+    for (int t = 0; t <= pos; t++) {
+        kv_cache_get(model->kv_cache, layer_idx, t, 
+                     k_cached + t * num_kv_heads * head_dim,
+                     v_cached + t * num_kv_heads * head_dim);
+    }
+    
+    int groups_per_head = num_heads / num_kv_heads;
+    float scale = 1.0f / sqrtf((float)head_dim);
+    
+    float* attn_out = (float*)calloc(num_heads * head_dim, sizeof(float));
+    
+    for (int h = 0; h < num_heads; h++) {
+        int kv_head = h / groups_per_head;
+        
+        float* scores = (float*)malloc(kv_len * sizeof(float));
+        for (int t = 0; t < kv_len; t++) {
+            float score = 0.0f;
+            for (int d = 0; d < head_dim; d++) {
+                score += q[h * head_dim + d] * k_cached[t * num_kv_heads * head_dim + kv_head * head_dim + d];
+            }
+            scores[t] = score * scale;
+        }
+        
+        softmax(scores, kv_len);
+        
+        for (int d = 0; d < head_dim; d++) {
+            float sum = 0.0f;
+            for (int t = 0; t < kv_len; t++) {
+                sum += scores[t] * v_cached[t * num_kv_heads * head_dim + kv_head * head_dim + d];
+            }
+            attn_out[h * head_dim + d] = sum;
+        }
+        
+        free(scores);
+    }
+    
+    matmul(attn_out, o_proj, output, num_heads * head_dim, hidden_size);
+    
+    free(q);
+    free(k);
+    free(v);
+    free(k_cached);
+    free(v_cached);
+    free(attn_out);
+}
+
+static void awq_mlp_single(Qwen3Model* model, const float* hidden_states, float* output, int layer_idx) {
+    int hidden_size = model->config.hidden_size;
+    int intermediate_size = model->config.intermediate_size;
+    int group_size = model->config.quant_group_size;
+    
+    AWQWeight* gate_awq = &model->gate_proj_awq[layer_idx];
+    AWQWeight* up_awq = &model->up_proj_awq[layer_idx];
+    AWQWeight* down_awq = &model->down_proj_awq[layer_idx];
+    
+    float* gate = (float*)malloc(intermediate_size * sizeof(float));
+    float* up = (float*)malloc(intermediate_size * sizeof(float));
+    
+    awq_matmul(hidden_states, gate_awq->qweight, gate_awq->scales_fp16, gate_awq->qzeros,
+               gate, hidden_size, intermediate_size, group_size);
+    awq_matmul(hidden_states, up_awq->qweight, up_awq->scales_fp16, up_awq->qzeros,
+               up, hidden_size, intermediate_size, group_size);
+    
+    silu(gate, intermediate_size);
+    
+    for (int i = 0; i < intermediate_size; i++) {
+        gate[i] *= up[i];
+    }
+    
+    awq_matmul(gate, down_awq->qweight, down_awq->scales_fp16, down_awq->qzeros,
+               output, intermediate_size, hidden_size, group_size);
+    
+    free(gate);
+    free(up);
+}
+
+static void awq_attention_single(Qwen3Model* model, const float* hidden_states, float* output, int pos, int layer_idx) {
+    int hidden_size = model->config.hidden_size;
+    int num_heads = model->config.num_attention_heads;
+    int num_kv_heads = model->config.num_key_value_heads;
+    int head_dim = model->config.head_dim;
+    int group_size = model->config.quant_group_size;
+    float eps = model->config.rms_norm_eps;
+    float rope_theta = model->config.rope_theta;
+    
+    AWQWeight* q_awq = &model->q_proj_awq[layer_idx];
+    AWQWeight* k_awq = &model->k_proj_awq[layer_idx];
+    AWQWeight* v_awq = &model->v_proj_awq[layer_idx];
+    AWQWeight* o_awq = &model->o_proj_awq[layer_idx];
+    
+    float* q = (float*)malloc(num_heads * head_dim * sizeof(float));
+    float* k = (float*)malloc(num_kv_heads * head_dim * sizeof(float));
+    float* v = (float*)malloc(num_kv_heads * head_dim * sizeof(float));
+    
+    awq_matmul(hidden_states, q_awq->qweight, q_awq->scales_fp16, q_awq->qzeros,
+               q, hidden_size, num_heads * head_dim, group_size);
+    awq_matmul(hidden_states, k_awq->qweight, k_awq->scales_fp16, k_awq->qzeros,
+               k, hidden_size, num_kv_heads * head_dim, group_size);
+    awq_matmul(hidden_states, v_awq->qweight, v_awq->scales_fp16, v_awq->qzeros,
+               v, hidden_size, num_kv_heads * head_dim, group_size);
+    
+    if (model->q_norm_weights && model->k_norm_weights) {
+        for (int h = 0; h < num_heads; h++) {
+            rms_norm(q + h * head_dim, q + h * head_dim, model->q_norm_weights + layer_idx * head_dim, head_dim, eps);
+        }
+        for (int h = 0; h < num_kv_heads; h++) {
+            rms_norm(k + h * head_dim, k + h * head_dim, model->k_norm_weights + layer_idx * head_dim, head_dim, eps);
+        }
+    }
+    
+    for (int h = 0; h < num_heads; h++) {
+        apply_rope_single(q + h * head_dim, pos, head_dim, rope_theta);
+    }
+    for (int h = 0; h < num_kv_heads; h++) {
+        apply_rope_single(k + h * head_dim, pos, head_dim, rope_theta);
+    }
+    
+    if (model->kv_cache) {
+        kv_cache_append(model->kv_cache, layer_idx, pos, k, v);
+    }
+    
+    int kv_len = pos + 1;
+    float* k_cached = (float*)malloc(kv_len * num_kv_heads * head_dim * sizeof(float));
+    float* v_cached = (float*)malloc(kv_len * num_kv_heads * head_dim * sizeof(float));
+    
+    for (int t = 0; t <= pos; t++) {
+        kv_cache_get(model->kv_cache, layer_idx, t, 
+                     k_cached + t * num_kv_heads * head_dim,
+                     v_cached + t * num_kv_heads * head_dim);
+    }
+    
+    int groups_per_head = num_heads / num_kv_heads;
+    float scale = 1.0f / sqrtf((float)head_dim);
+    
+    float* attn_out = (float*)calloc(num_heads * head_dim, sizeof(float));
+    
+    for (int h = 0; h < num_heads; h++) {
+        int kv_head = h / groups_per_head;
+        
+        float* scores = (float*)malloc(kv_len * sizeof(float));
+        for (int t = 0; t < kv_len; t++) {
+            float score = 0.0f;
+            for (int d = 0; d < head_dim; d++) {
+                score += q[h * head_dim + d] * k_cached[t * num_kv_heads * head_dim + kv_head * head_dim + d];
+            }
+            scores[t] = score * scale;
+        }
+        
+        softmax(scores, kv_len);
+        
+        for (int d = 0; d < head_dim; d++) {
+            float sum = 0.0f;
+            for (int t = 0; t < kv_len; t++) {
+                sum += scores[t] * v_cached[t * num_kv_heads * head_dim + kv_head * head_dim + d];
+            }
+            attn_out[h * head_dim + d] = sum;
+        }
+        
+        free(scores);
+    }
+    
+    awq_matmul(attn_out, o_awq->qweight, o_awq->scales_fp16, o_awq->qzeros,
+               output, num_heads * head_dim, hidden_size, group_size);
+    
+    free(q);
+    free(k);
+    free(v);
+    free(k_cached);
+    free(v_cached);
+    free(attn_out);
+}
+
 static void mlp(
     Qwen3Model* model,
     const float* hidden_states,
@@ -430,9 +660,18 @@ static float* forward(Qwen3Model* model, const int* input_ids, int seq_len) {
     for (int s = 0; s < seq_len; s++) {
         int token_id = input_ids[s];
         if (token_id >= 0 && token_id < vocab_size) {
-            memcpy(hidden_states + s * hidden_size, 
-                   model->embed_tokens + token_id * hidden_size, 
-                   hidden_size * sizeof(float));
+            if (model->embed_is_bf16 && model->embed_tokens_bf16) {
+                for (int h = 0; h < hidden_size; h++) {
+                    uint16_t bf16_val = model->embed_tokens_bf16[token_id * hidden_size + h];
+                    hidden_states[s * hidden_size + h] = bf16_to_f32(bf16_val);
+                }
+            } else if (model->embed_tokens) {
+                memcpy(hidden_states + s * hidden_size, 
+                       model->embed_tokens + token_id * hidden_size, 
+                       hidden_size * sizeof(float));
+            } else {
+                memset(hidden_states + s * hidden_size, 0, hidden_size * sizeof(float));
+            }
         } else {
             memset(hidden_states + s * hidden_size, 0, hidden_size * sizeof(float));
         }
@@ -655,8 +894,9 @@ Qwen3Model* model_load(const char* model_dir, const ModelConfig* config) {
                                                   "model.embed_tokens.weight", &embed_size);
     if (embed_bf16) {
         size_t num_embed = embed_size / sizeof(uint16_t);
-        model->embed_tokens = convert_bf16_to_f32(embed_bf16, num_embed);
-        printf("Converted embed_tokens from BF16 to FP32: %zu elements\n", num_embed);
+        model->embed_tokens_bf16 = embed_bf16;
+        model->embed_is_bf16 = true;
+        printf("Loaded embed_tokens in BF16 (mmap, no conversion): %zu elements\n", num_embed);
     }
     
     model->input_layernorm_weights = (float*)malloc(num_layers * hidden_size * sizeof(float));
@@ -874,6 +1114,14 @@ int model_generate(Qwen3Model* model, const int* input_tokens, size_t input_len,
                        model->lm_head_awq->qweight, model->lm_head_awq->scales_fp16,
                        model->lm_head_awq->qzeros, logits,
                        hidden_size, vocab_size, model->config.quant_group_size);
+        } else if (model->embed_is_bf16 && model->embed_tokens_bf16) {
+            for (int v = 0; v < vocab_size; v++) {
+                logits[v] = 0.0f;
+                for (int h = 0; h < hidden_size; h++) {
+                    uint16_t bf16_val = model->embed_tokens_bf16[v * hidden_size + h];
+                    logits[v] += hidden_states[(total_len - 1) * hidden_size + h] * bf16_to_f32(bf16_val);
+                }
+            }
         } else if (model->embed_tokens) {
             for (int v = 0; v < vocab_size; v++) {
                 logits[v] = 0.0f;
@@ -908,6 +1156,177 @@ int model_generate(Qwen3Model* model, const int* input_tokens, size_t input_len,
             break;
         }
     }
+    
+    *output_tokens = (int*)malloc(total_len * sizeof(int));
+    memcpy(*output_tokens, all_ids, total_len * sizeof(int));
+    *output_len = total_len;
+    
+    free(all_ids);
+    
+    return 0;
+}
+
+void model_init_cache(Qwen3Model* model, int max_seq_len) {
+    if (model->kv_cache) {
+        kv_cache_free(model->kv_cache);
+    }
+    model->kv_cache = kv_cache_create(
+        model->config.num_hidden_layers,
+        model->config.num_attention_heads,
+        model->config.num_key_value_heads,
+        model->config.head_dim,
+        max_seq_len
+    );
+    model->kv_cache_len = 0;
+    printf("Initialized KV cache: max_seq_len=%d, layers=%d\n", 
+           max_seq_len, model->config.num_hidden_layers);
+}
+
+void model_free_cache(Qwen3Model* model) {
+    if (model->kv_cache) {
+        kv_cache_free(model->kv_cache);
+        model->kv_cache = NULL;
+    }
+    model->kv_cache_len = 0;
+}
+
+static float* forward_single_token(Qwen3Model* model, int token_id, int pos) {
+    int hidden_size = model->config.hidden_size;
+    int num_layers = model->config.num_hidden_layers;
+    float eps = model->config.rms_norm_eps;
+    bool is_awq = (model->config.quant_method == QUANT_AWQ);
+    
+    float* hidden = (float*)malloc(hidden_size * sizeof(float));
+    
+    if (token_id >= 0 && token_id < model->config.vocab_size) {
+        if (model->embed_is_bf16 && model->embed_tokens_bf16) {
+            for (int h = 0; h < hidden_size; h++) {
+                uint16_t bf16_val = model->embed_tokens_bf16[token_id * hidden_size + h];
+                hidden[h] = bf16_to_f32(bf16_val);
+            }
+        } else if (model->embed_tokens) {
+            memcpy(hidden, model->embed_tokens + token_id * hidden_size, hidden_size * sizeof(float));
+        } else {
+            memset(hidden, 0, hidden_size * sizeof(float));
+        }
+    } else {
+        memset(hidden, 0, hidden_size * sizeof(float));
+    }
+    
+    float* layer_input = (float*)malloc(hidden_size * sizeof(float));
+    float* attn_output = (float*)malloc(hidden_size * sizeof(float));
+    float* mlp_output = (float*)malloc(hidden_size * sizeof(float));
+    float* norm_hidden = (float*)malloc(hidden_size * sizeof(float));
+    
+    for (int layer = 0; layer < num_layers; layer++) {
+        memcpy(layer_input, hidden, hidden_size * sizeof(float));
+        
+        rms_norm(norm_hidden, hidden, model->input_layernorm_weights + layer * hidden_size, hidden_size, eps);
+        
+        if (is_awq) {
+            awq_attention_single(model, norm_hidden, attn_output, pos, layer);
+        } else {
+            attention_single(model, norm_hidden, attn_output, pos, layer);
+        }
+        
+        for (int i = 0; i < hidden_size; i++) {
+            hidden[i] = layer_input[i] + attn_output[i];
+        }
+        
+        memcpy(layer_input, hidden, hidden_size * sizeof(float));
+        
+        rms_norm(norm_hidden, hidden, model->post_attention_layernorm_weights + layer * hidden_size, hidden_size, eps);
+        
+        if (is_awq) {
+            awq_mlp_single(model, norm_hidden, mlp_output, layer);
+        } else {
+            mlp_single(model, norm_hidden, mlp_output, layer);
+        }
+        
+        for (int i = 0; i < hidden_size; i++) {
+            hidden[i] = layer_input[i] + mlp_output[i];
+        }
+    }
+    
+    free(layer_input);
+    free(attn_output);
+    free(mlp_output);
+    free(norm_hidden);
+    
+    return hidden;
+}
+
+int model_generate_with_cache(Qwen3Model* model, const int* input_tokens, size_t input_len,
+                               float temperature, int top_k, float top_p, int max_length,
+                               int** output_tokens, size_t* output_len) {
+    int vocab_size = model->config.vocab_size;
+    int hidden_size = model->config.hidden_size;
+    int eos_token_id = model->config.eos_token_id;
+    bool is_awq = (model->config.quant_method == QUANT_AWQ);
+    
+    if (!model->kv_cache) {
+        model_init_cache(model, input_len + max_length);
+    }
+    
+    printf("Starting incremental generation (AWQ: %s, KV Cache: enabled)...\n", is_awq ? "yes" : "no");
+    
+    int* all_ids = (int*)malloc((input_len + max_length) * sizeof(int));
+    memcpy(all_ids, input_tokens, input_len * sizeof(int));
+    int total_len = input_len;
+    
+    float* hidden = NULL;
+    for (size_t i = 0; i < input_len; i++) {
+        hidden = forward_single_token(model, input_tokens[i], model->kv_cache_len);
+        model->kv_cache_len++;
+    }
+    
+    printf("Prefill complete: %zu tokens\n", input_len);
+    
+    for (int gen_idx = 0; gen_idx < max_length; gen_idx++) {
+        float* logits = (float*)malloc(vocab_size * sizeof(float));
+        
+        if (is_awq && model->lm_head_awq && model->lm_head_awq->qweight) {
+            awq_matmul(hidden,
+                       model->lm_head_awq->qweight, model->lm_head_awq->scales_fp16,
+                       model->lm_head_awq->qzeros, logits,
+                       hidden_size, vocab_size, model->config.quant_group_size);
+        } else if (model->embed_is_bf16 && model->embed_tokens_bf16) {
+            for (int v = 0; v < vocab_size; v++) {
+                logits[v] = 0.0f;
+                for (int h = 0; h < hidden_size; h++) {
+                    uint16_t bf16_val = model->embed_tokens_bf16[v * hidden_size + h];
+                    logits[v] += hidden[h] * bf16_to_f32(bf16_val);
+                }
+            }
+        } else if (model->embed_tokens) {
+            for (int v = 0; v < vocab_size; v++) {
+                logits[v] = 0.0f;
+                for (int h = 0; h < hidden_size; h++) {
+                    logits[v] += hidden[h] * model->embed_tokens[v * hidden_size + h];
+                }
+            }
+        } else {
+            memset(logits, 0, vocab_size * sizeof(float));
+        }
+        
+        int next_token = sample_top_k(logits, vocab_size, top_k, temperature);
+        
+        free(logits);
+        if (hidden) free(hidden);
+        
+        all_ids[total_len++] = next_token;
+        
+        printf("Generated token %d: %d\n", gen_idx + 1, next_token);
+        
+        if (next_token == eos_token_id) {
+            break;
+        }
+        
+        hidden = forward_single_token(model, next_token, model->kv_cache_len);
+        model->kv_cache_len++;
+    }
+    
+    if (hidden) free(hidden);
     
     *output_tokens = (int*)malloc(total_len * sizeof(int));
     memcpy(*output_tokens, all_ids, total_len * sizeof(int));

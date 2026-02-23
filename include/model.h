@@ -4,6 +4,7 @@
 #include "config.h"
 #include "safetensors.h"
 #include "common.h"
+#include "kv_cache.h"
 
 typedef struct {
     uint8_t* qweight;
@@ -17,6 +18,8 @@ typedef struct {
     ModelConfig config;
     
     float* embed_tokens;
+    uint16_t* embed_tokens_bf16;
+    bool embed_is_bf16;
     
     float** q_proj_weight;
     float** k_proj_weight;
@@ -50,6 +53,9 @@ typedef struct {
     
     SafetensorsReader** readers;
     int num_readers;
+    
+    KVCache* kv_cache;
+    int kv_cache_len;
 } Qwen3Model;
 
 Qwen3Model* model_load(const char* model_dir, const ModelConfig* config);
@@ -59,22 +65,17 @@ int model_generate(Qwen3Model* model, const int* input_tokens, size_t input_len,
                    float temperature, int top_k, float top_p, int max_length,
                    int** output_tokens, size_t* output_len);
 
+int model_generate_with_cache(Qwen3Model* model, const int* input_tokens, size_t input_len,
+                               float temperature, int top_k, float top_p, int max_length,
+                               int** output_tokens, size_t* output_len);
+
+void model_init_cache(Qwen3Model* model, int max_seq_len);
+void model_free_cache(Qwen3Model* model);
+
 typedef struct {
     float* data;
     int dim;
     int batch_size;
 } HiddenState;
-
-typedef struct {
-    float* q;
-    float* k;
-    float* v;
-    int q_len;
-    int kv_len;
-} KVCache;
-
-KVCache* kv_cache_create(int num_layers, int num_heads, int num_kv_heads, int head_dim, int max_seq_len);
-void kv_cache_free(KVCache* cache);
-void kv_cache_update(KVCache* cache, int layer_idx, int pos, const float* k, const float* v);
 
 #endif
