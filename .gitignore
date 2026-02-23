@@ -36,6 +36,13 @@ verify_awq
 verify_dequant
 parse_vocab_new
 
+# Test source files
+check_*.c
+check_*.py
+test_*.c
+verify_*.c
+parse_vocab_*.c
+
 # Output files
 output.txt
 *.log
