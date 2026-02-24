@@ -176,6 +176,17 @@ Tokenizer* tokenizer_load(const char* tokenizer_dir) {
         return NULL;
     }
     
+    snprintf(path, sizeof(path), "%s/merges.txt", tokenizer_dir);
+    size_t merges_size;
+    char* merges_data = read_file(path, &merges_size);
+    if (merges_data) {
+        tok->merges = merges_data;
+        tok->merges_size = merges_size;
+        printf("Loaded merges.txt: %zu bytes\n", merges_size);
+    } else {
+        printf("Warning: merges.txt not found, BPE may not work correctly\n");
+    }
+    
     const char* model_key = "\"model\":";
     const char* model_start = strstr(data, model_key);
     if (!model_start) {

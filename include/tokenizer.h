@@ -22,6 +22,8 @@ typedef struct {
     int pad_token_id;
     int eos_token_id2;
     char* chat_template;
+    char* merges;
+    size_t merges_size;
 } Tokenizer;
 
 Tokenizer* tokenizer_load(const char* tokenizer_dir);

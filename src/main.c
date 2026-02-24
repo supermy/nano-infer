@@ -127,6 +127,11 @@ static int generate(Qwen3Model* model, Tokenizer* tokenizer, const char* prompt,
     }
     
     printf("[Input tokens: %zu]\n", token_len);
+    printf("Input token IDs: ");
+    for (size_t i = 0; i < token_len && i < 10; i++) {
+        printf("%d ", tokens[i]);
+    }
+    printf("\n");
     printf("Prompt: %s\n\n", prompt);
     printf("Generating...\n\n");
     
